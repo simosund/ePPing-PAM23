@@ -145,6 +145,12 @@ struct {
 	__uint(value_size, sizeof(__u32));
 } events SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct aggregated_rtt_stats);
+	__uint(max_entries, 1);
+} agg_rtt_stat SEC(".maps");
 
 // Help functions
 
@@ -630,6 +636,9 @@ static bool is_rate_limited(__u64 now, __u64 last_ts, __u64 rtt)
 static void send_flow_open_event(void *ctx, struct packet_info *p_info,
 				 struct flow_state *rev_flow)
 {
+	if (!config.push_individual_events)
+		return;
+
 	struct flow_event fe = {
 		.event_type = EVENT_TYPE_FLOW,
 		.flow_event_type = FLOW_EVENT_OPENING,
@@ -653,6 +662,9 @@ static void send_flow_open_event(void *ctx, struct packet_info *p_info,
 static void send_flow_event(void *ctx, struct packet_info *p_info,
 			    bool rev_flow)
 {
+	if (!config.push_individual_events)
+		return;
+
 	struct flow_event fe = {
 		.event_type = EVENT_TYPE_FLOW,
 		.flow_event_type = p_info->event_type,
@@ -697,8 +709,11 @@ static void send_map_full_event(void *ctx, struct packet_info *p_info,
 }
 
 static void send_rtt_event(void *ctx, __u64 rtt, struct flow_state *f_state,
-			  struct packet_info *p_info)
+			   struct packet_info *p_info)
 {
+	if (!config.push_individual_events)
+		return;
+
 	struct rtt_event re = {
 		.event_type = EVENT_TYPE_RTT,
 		.timestamp = p_info->time,
@@ -906,6 +921,28 @@ static bool is_local_address(struct packet_info *p_info, void *ctx)
 	       ret == BPF_FIB_LKUP_RET_FWD_DISABLED;
 }
 
+static void aggregate_rtt(__u64 rtt)
+{
+	if (!config.agg_rtts)
+		return;
+
+	struct aggregated_rtt_stats *rtt_agg;
+	__u32 key = 0, bin_idx;
+
+	rtt_agg = bpf_map_lookup_elem(&agg_rtt_stat, &key);
+	if (!rtt_agg)
+		return;
+
+	if (!rtt_agg->min || rtt < rtt_agg->min)
+		rtt_agg->min = rtt;
+	if (rtt > rtt_agg->max)
+		rtt_agg->max = rtt;
+
+	bin_idx = rtt / RTT_AGG_BIN_WIDTH;
+	bin_idx = bin_idx >= RTT_AGG_NR_BINS ? RTT_AGG_NR_BINS - 1 : bin_idx;
+	rtt_agg->bins[bin_idx]++;
+}
+
 /*
  * Attempt to create a timestamp-entry for packet p_info for flow in f_state
  */
@@ -977,6 +1014,7 @@ static void pping_match_packet(struct flow_state *f_state, void *ctx,
 	f_state->srtt = calculate_srtt(f_state->srtt, rtt);
 
 	send_rtt_event(ctx, rtt, f_state, p_info);
+	aggregate_rtt(rtt);
 }
 
 /*
@@ -1069,6 +1107,9 @@ static bool is_flow_old(struct network_tuple *flow, struct flow_state *f_state,
 static void send_flow_timeout_message(void *ctx, struct network_tuple *flow,
 				      __u64 time)
 {
+	if (!config.push_individual_events)
+		return;
+
 	struct flow_event fe = {
 		.event_type = EVENT_TYPE_FLOW,
 		.flow_event_type = FLOW_EVENT_CLOSING,

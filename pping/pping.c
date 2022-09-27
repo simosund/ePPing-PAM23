@@ -61,12 +61,23 @@ struct map_cleanup_args {
 	bool valid_thread;
 };
 
+
+// Structure to contain arguments for periodic_rtt_aggregation (for passing
+// to pthread_create). Also keeps info on thread in which aggregation runs.
+struct aggregation_args {
+	pthread_t tid;
+	int map_fd;
+	__u64 aggregation_interval;
+	bool valid_thread;
+};
+
 // Store configuration values in struct to easily pass around
 struct pping_config {
 	struct bpf_config bpf_config;
 	struct bpf_tc_opts tc_ingress_opts;
 	struct bpf_tc_opts tc_egress_opts;
 	struct map_cleanup_args clean_args;
+	struct aggregation_args agg_args;
 	char *object_path;
 	char *ingress_prog;
 	char *egress_prog;
@@ -75,6 +86,7 @@ struct pping_config {
 	char *packet_map;
 	char *flow_map;
 	char *event_map;
+	char *agg_map;
 	int ifindex;
 	struct xdp_program *xdp_prog;
 	int ingress_prog_id;
@@ -102,6 +114,7 @@ static const struct option long_options[] = {
 	{ "tcp",              no_argument,       NULL, 'T' }, // Calculate and report RTTs for TCP traffic (with TCP timestamps)
 	{ "icmp",             no_argument,       NULL, 'C' }, // Calculate and report RTTs for ICMP echo-reply traffic
 	{ "include-local",    no_argument,       NULL, 'l' }, // Also report "internal" RTTs
+	{ "aggregate",        required_argument, NULL, 'a' }, // Periodically aggregate RTTs instead of reporting them individually
 	{ 0, 0, NULL, 0 }
 };
 
@@ -163,15 +176,17 @@ static int parse_bounded_double(double *res, const char *str, double low,
 static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 {
 	int err, opt;
-	double rate_limit_ms, cleanup_interval_s, rtt_rate;
+	double rate_limit_ms, cleanup_interval_s, rtt_rate, agg_interval;
 
 	config->ifindex = 0;
 	config->bpf_config.localfilt = true;
 	config->force = false;
 	config->bpf_config.track_tcp = false;
 	config->bpf_config.track_icmp = false;
+	config->bpf_config.push_individual_events = true;
+	config->bpf_config.agg_rtts = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCi:r:R:t:c:F:I:",
+	while ((opt = getopt_long(argc, argv, "hflTCi:r:R:t:c:F:I:a:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -265,6 +280,36 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 			break;
 		case 'C':
 			config->bpf_config.track_icmp = true;
+			break;
+		case 'a':
+			/* Aggregated output currently disables individual RTT
+			 * reports, as using both may cause the output to
+			 * interleave in strange fashion as neither the
+			 * individual reports nor aggregated reports write the
+			 * entire entry as an atmoic operation (meaning that
+			 * parts of individual reports may be mixed with parts
+			 * of an aggregated report).
+			 *
+			 * If deemed necessary it would be possible to support
+			 * both individual and aggregated reports simultaniously
+			 * in the future. The BPF side can already both push and
+			 * aggregate RTTs at the same time, and the userside
+			 * uses different threads to concurrently poll the
+			 * individual events and periodically lookup the
+			 * aggregation map. It's simply a matter of fixing
+			 * so that both threads can write to the same stream
+			 * concurrently without causing issues. */
+
+			config->bpf_config.push_individual_events = false;
+			config->bpf_config.agg_rtts = true;
+
+			err = parse_bounded_double(&agg_interval, optarg, 0,
+						   7 * S_PER_DAY, "aggregate");
+			if (err)
+				return -EINVAL;
+
+			config->agg_args.aggregation_interval =
+				agg_interval * NS_PER_SECOND;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -833,6 +878,95 @@ static void handle_missed_events(void *ctx, int cpu, __u64 lost_cnt)
 	fprintf(stderr, "Lost %llu events on CPU %d\n", lost_cnt, cpu);
 }
 
+static void print_histogram(FILE *stream,
+			    struct aggregated_rtt_stats *rtt_stats)
+{
+	int i;
+
+	fprintf(stream, "[%llu", rtt_stats->bins[0]);
+	for (i = 1; i < RTT_AGG_NR_BINS; i++)
+		fprintf(stream, ",%llu", rtt_stats->bins[i]);
+	fprintf(stream, "]");
+}
+
+static void print_aggregated_rtts(FILE *stream,
+				  struct aggregated_rtt_stats *rtt_stats)
+{
+	__u64 t = get_time_ns(CLOCK_REALTIME);
+	fprintf(stream,
+		"%llu.%09llu: min=%llu.%06llu ms, max=%llu.%06llu ms, bin-width=%lu.%06lu ms, bins=",
+		t / NS_PER_SECOND, t % NS_PER_SECOND,
+		rtt_stats->min / NS_PER_MS, rtt_stats->min % NS_PER_MS,
+		rtt_stats->max / NS_PER_MS, rtt_stats->max % NS_PER_MS,
+		RTT_AGG_BIN_WIDTH / NS_PER_MS, RTT_AGG_BIN_WIDTH % NS_PER_MS);
+	print_histogram(stream, rtt_stats);
+	fprintf(stream, "\n");
+}
+
+static int get_aggregated_rtts(int map_fd,
+			       struct aggregated_rtt_stats *rtt_stats)
+{
+	struct aggregated_rtt_stats *per_cpu_rtt_stats;
+	int nr_cpus = libbpf_num_possible_cpus();
+	int err, i, j;
+	__u32 key = 0;
+
+	memset(rtt_stats, 0, sizeof(*rtt_stats));
+
+	per_cpu_rtt_stats = malloc(sizeof(*per_cpu_rtt_stats) * nr_cpus);
+	if (!per_cpu_rtt_stats)
+		return -errno;
+
+	err = bpf_map_lookup_elem(map_fd, &key, per_cpu_rtt_stats);
+	if (err)
+		goto exit;
+
+	// Summarize stats from all CPUs
+	for (i = 0; i < nr_cpus; i++) {
+		if (!rtt_stats->min ||
+		    (per_cpu_rtt_stats[i].min &&
+		     per_cpu_rtt_stats[i].min < rtt_stats->min))
+			rtt_stats->min = per_cpu_rtt_stats[i].min;
+		if (per_cpu_rtt_stats[i].max > rtt_stats->max)
+			rtt_stats->max = per_cpu_rtt_stats[i].max;
+
+		for (j = 0; j < RTT_AGG_NR_BINS; j++)
+			rtt_stats->bins[j] += per_cpu_rtt_stats[i].bins[j];
+	}
+
+exit:
+	free(per_cpu_rtt_stats);
+	return err;
+}
+
+static void *periodic_rtt_aggregation(void *args)
+{
+	struct aggregation_args *argp = args;
+	struct aggregated_rtt_stats rtt_stats;
+	char buf[256];
+	int err;
+
+	struct timespec interval = {
+		.tv_sec = argp->aggregation_interval / NS_PER_SECOND,
+		.tv_nsec = argp->aggregation_interval % NS_PER_SECOND,
+	};
+
+	while (keep_running) {
+		err = get_aggregated_rtts(argp->map_fd, &rtt_stats);
+		if (err) {
+			libbpf_strerror(err, buf, sizeof(buf));
+			fprintf(stderr, "Failed aggregating per-CPU RTTs: %s\n",
+				buf);
+		} else {
+			print_aggregated_rtts(stdout, &rtt_stats);
+		}
+
+		nanosleep(&interval, NULL);
+	}
+
+	pthread_exit(NULL);
+}
+
 /*
  * Sets only the necessary programs in the object file to autoload.
  *
@@ -988,6 +1122,38 @@ destroy_ts_link:
 	return err;
 }
 
+int setup_periodical_aggregate_rtts(struct bpf_object *obj,
+				    struct pping_config *config)
+{
+	int err = 0, fd;
+
+	if (config->agg_args.valid_thread) {
+		fprintf(stderr,
+			"There already exists a thread for RTT aggregation\n");
+		return -EINVAL;
+	}
+
+	fd = bpf_object__find_map_fd_by_name(obj, config->agg_map);
+	if (fd < 0) {
+		fprintf(stderr, "Unable to find aggregation map %s: %s\n",
+			config->agg_map, get_libbpf_strerror(fd));
+		return fd;
+	}
+	config->agg_args.map_fd = fd;
+
+	err = pthread_create(&config->agg_args.tid, NULL,
+			     periodic_rtt_aggregation, &config->agg_args);
+	if (err) {
+		fprintf(stderr,
+			"Failed starting thread to periodically aggregate RTTs: %s\n",
+			get_libbpf_strerror(err));
+		return err;
+	}
+
+	config->agg_args.valid_thread = true;
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	int err = 0, detach_err;
@@ -1003,6 +1169,8 @@ int main(int argc, char *argv[])
 				.use_srtt = false },
 		.clean_args = { .cleanup_interval = 1 * NS_PER_SECOND,
 				.valid_thread = false },
+		.agg_args = { .aggregation_interval = 1 * NS_PER_SECOND,
+			      .valid_thread = false },
 		.object_path = "pping_kern.o",
 		.ingress_prog = "pping_xdp_ingress",
 		.egress_prog = "pping_tc_egress",
@@ -1011,6 +1179,7 @@ int main(int argc, char *argv[])
 		.packet_map = "packet_ts",
 		.flow_map = "flow_state",
 		.event_map = "events",
+		.agg_map = "agg_rtt_stat",
 		.tc_ingress_opts = tc_ingress_opts,
 		.tc_egress_opts = tc_egress_opts,
 		.output_format = PPING_OUTPUT_STANDARD,
@@ -1093,6 +1262,16 @@ int main(int argc, char *argv[])
 		goto cleanup_perf_buffer;
 	}
 
+	if (config.bpf_config.agg_rtts) {
+		err = setup_periodical_aggregate_rtts(obj, &config);
+		if (err) {
+			fprintf(stderr,
+				"Failed setting up periodical aggregation: %s\n",
+				get_libbpf_strerror(err));
+			goto cleanup_periodical_cleaning;
+		}
+	}
+
 	// Main loop
 	while (keep_running) {
 		if ((err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS)) < 0) {
@@ -1110,6 +1289,12 @@ int main(int argc, char *argv[])
 		jsonw_destroy(&json_ctx);
 	}
 
+	if (config.agg_args.valid_thread) {
+		pthread_cancel(config.agg_args.tid);
+		pthread_join(config.agg_args.tid, NULL);
+	}
+
+cleanup_periodical_cleaning:
 	if (config.clean_args.valid_thread) {
 		pthread_cancel(config.clean_args.tid);
 		pthread_join(config.clean_args.tid, NULL);

@@ -22,6 +22,9 @@ typedef __u64 fixpoint64;
 #define EVENT_TYPE_MAP_FULL 3
 #define EVENT_TYPE_MAP_CLEAN 4
 
+#define RTT_AGG_NR_BINS 1000UL
+#define RTT_AGG_BIN_WIDTH 100000UL // 0.1 ms (100,000 ns)
+
 enum __attribute__((__packed__)) flow_event_type {
 	FLOW_EVENT_NONE,
 	FLOW_EVENT_OPENING,
@@ -64,7 +67,9 @@ struct bpf_config {
 	bool track_tcp;
 	bool track_icmp;
 	bool localfilt;
-	__u32 reserved;
+	bool push_individual_events;
+	bool agg_rtts;
+	__u16 reserved;
 };
 
 /*
@@ -206,6 +211,12 @@ union pping_event {
 	struct flow_event flow_event;
 	struct map_full_event map_event;
 	struct map_clean_event map_clean_event;
+};
+
+struct aggregated_rtt_stats {
+	__u64 min;
+	__u64 max;
+	__u64 bins[RTT_AGG_NR_BINS];
 };
 
 #endif
