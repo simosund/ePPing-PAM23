@@ -67,6 +67,7 @@ struct map_cleanup_args {
 struct aggregation_args {
 	pthread_t tid;
 	int map_fd;
+	int map_idx_fd;
 	__u64 aggregation_interval;
 	bool valid_thread;
 };
@@ -87,6 +88,7 @@ struct pping_config {
 	char *flow_map;
 	char *event_map;
 	char *agg_map;
+	char *agg_map_idx;
 	int ifindex;
 	struct xdp_program *xdp_prog;
 	int ingress_prog_id;
@@ -883,9 +885,9 @@ static void print_histogram(FILE *stream,
 {
 	int i;
 
-	fprintf(stream, "[%llu", rtt_stats->bins[0]);
+	fprintf(stream, "[%u", rtt_stats->bins[0]);
 	for (i = 1; i < RTT_AGG_NR_BINS; i++)
-		fprintf(stream, ",%llu", rtt_stats->bins[i]);
+		fprintf(stream, ",%u", rtt_stats->bins[i]);
 	fprintf(stream, "]");
 }
 
@@ -903,12 +905,53 @@ static void print_aggregated_rtts(FILE *stream,
 	fprintf(stream, "\n");
 }
 
-static int get_aggregated_rtts(int map_fd,
+/* Changes which map the BPF progs use to aggregate the RTTs in.
+ * On success returns the map idx that the BPF progs used BEFORE the switch
+ * (and thus the map filled with data up until the switch, but no longer
+ * beeing activly used by the BPF progs).
+ * On failure returns a negative error code */
+static int switch_agg_map(int map_idx_fd)
+{
+	int nr_cpus = libbpf_num_possible_cpus();
+	__u64 active_idx, next_idx, key = 0;
+	__u64 *percpu_map_idx;
+	int i, err;
+
+	percpu_map_idx = malloc(sizeof(*percpu_map_idx) * nr_cpus);
+	if (!percpu_map_idx)
+		return -errno;
+
+	// Get current map being used by BPF progs
+	err = bpf_map_lookup_elem(map_idx_fd, &key, percpu_map_idx);
+	if (err)
+		goto exit;
+
+	// Verify all CPUs use same map idx
+	active_idx = percpu_map_idx[0];
+	for (i = 1; i < nr_cpus; i++) {
+		if (percpu_map_idx[i] != active_idx) {
+			err = -EINVAL;
+			goto exit;
+		}
+	}
+
+	// Swap map being used by BPF progs to agg RTTs in
+	next_idx = active_idx ? 0 : 1;
+	for (i = 0; i < nr_cpus; i++)
+		percpu_map_idx[i] = next_idx;
+	err = bpf_map_update_elem(map_idx_fd, &key, percpu_map_idx, BPF_EXIST);
+
+exit:
+	free(percpu_map_idx);
+	return err ? err : active_idx;
+}
+
+static int get_aggregated_rtts(int map_fd, int map_idx_fd,
 			       struct aggregated_rtt_stats *rtt_stats)
 {
 	struct aggregated_rtt_stats *per_cpu_rtt_stats;
 	int nr_cpus = libbpf_num_possible_cpus();
-	int err, i, j;
+	int err, err2, i, j;
 	__u32 key = 0;
 
 	memset(rtt_stats, 0, sizeof(*rtt_stats));
@@ -917,9 +960,14 @@ static int get_aggregated_rtts(int map_fd,
 	if (!per_cpu_rtt_stats)
 		return -errno;
 
+	err = switch_agg_map(map_idx_fd);
+	if (err < 0)
+		goto exit_before_switch;
+	key = err;
+
 	err = bpf_map_lookup_elem(map_fd, &key, per_cpu_rtt_stats);
 	if (err)
-		goto exit;
+		goto exit_after_switch;
 
 	// Summarize stats from all CPUs
 	for (i = 0; i < nr_cpus; i++) {
@@ -934,7 +982,13 @@ static int get_aggregated_rtts(int map_fd,
 			rtt_stats->bins[j] += per_cpu_rtt_stats[i].bins[j];
 	}
 
-exit:
+exit_after_switch:
+	// Clear RTT stats
+	memset(per_cpu_rtt_stats, 0, sizeof(*per_cpu_rtt_stats) * nr_cpus);
+	err2 = bpf_map_update_elem(map_fd, &key, per_cpu_rtt_stats, BPF_EXIST);
+	err = err ? err : err2;
+
+exit_before_switch:
 	free(per_cpu_rtt_stats);
 	return err;
 }
@@ -952,7 +1006,8 @@ static void *periodic_rtt_aggregation(void *args)
 	};
 
 	while (keep_running) {
-		err = get_aggregated_rtts(argp->map_fd, &rtt_stats);
+		err = get_aggregated_rtts(argp->map_fd, argp->map_idx_fd,
+					  &rtt_stats);
 		if (err) {
 			libbpf_strerror(err, buf, sizeof(buf));
 			fprintf(stderr, "Failed aggregating per-CPU RTTs: %s\n",
@@ -1141,6 +1196,14 @@ int setup_periodical_aggregate_rtts(struct bpf_object *obj,
 	}
 	config->agg_args.map_fd = fd;
 
+	fd = bpf_object__find_map_fd_by_name(obj, config->agg_map_idx);
+	if (fd < 0) {
+		fprintf(stderr, "Unable to find aggregation idx map %s: %s\n",
+			config->agg_map_idx, get_libbpf_strerror(fd));
+		return fd;
+	}
+	config->agg_args.map_idx_fd = fd;
+
 	err = pthread_create(&config->agg_args.tid, NULL,
 			     periodic_rtt_aggregation, &config->agg_args);
 	if (err) {
@@ -1180,6 +1243,7 @@ int main(int argc, char *argv[])
 		.flow_map = "flow_state",
 		.event_map = "events",
 		.agg_map = "agg_rtt_stat",
+		.agg_map_idx = "agg_rtt_stat_idx",
 		.tc_ingress_opts = tc_ingress_opts,
 		.tc_egress_opts = tc_egress_opts,
 		.output_format = PPING_OUTPUT_STANDARD,

@@ -149,8 +149,15 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, __u32);
 	__type(value, struct aggregated_rtt_stats);
-	__uint(max_entries, 1);
+	__uint(max_entries, 2);
 } agg_rtt_stat SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 1);
+} agg_rtt_stat_idx SEC(".maps");
 
 // Help functions
 
@@ -928,6 +935,12 @@ static void aggregate_rtt(__u64 rtt)
 
 	struct aggregated_rtt_stats *rtt_agg;
 	__u32 key = 0, bin_idx;
+	__u64 *agg_map_idx;
+
+	agg_map_idx = bpf_map_lookup_elem(&agg_rtt_stat_idx, &key);
+	if (!agg_map_idx)
+		return;
+	key = *agg_map_idx;
 
 	rtt_agg = bpf_map_lookup_elem(&agg_rtt_stat, &key);
 	if (!rtt_agg)
