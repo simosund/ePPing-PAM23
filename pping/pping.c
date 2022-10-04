@@ -102,6 +102,7 @@ struct pping_config {
 static volatile sig_atomic_t keep_running = 1;
 static json_writer_t *json_ctx = NULL;
 static void (*print_event_func)(const union pping_event *) = NULL;
+static bool userspace_drop_report = false;
 
 static const struct option long_options[] = {
 	{ "help",             no_argument,       NULL, 'h' },
@@ -117,8 +118,11 @@ static const struct option long_options[] = {
 	{ "icmp",             no_argument,       NULL, 'C' }, // Calculate and report RTTs for ICMP echo-reply traffic
 	{ "include-local",    no_argument,       NULL, 'l' }, // Also report "internal" RTTs
 	{ "aggregate",        required_argument, NULL, 'a' }, // Periodically aggregate RTTs instead of reporting them individually
+	{ "kernel-drop",      no_argument,       NULL, 'k' }, // Do not push RTT report from kernel side (for testing only)
+	{ "user-drop",        no_argument,       NULL, 'u' }, // Do not print out RTT report on user space side (for testing only)
 	{ 0, 0, NULL, 0 }
 };
+
 
 /*
  * Copied from Jesper Dangaaard Brouer's traffic-pacing-edt example
@@ -188,7 +192,7 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.push_individual_events = true;
 	config->bpf_config.agg_rtts = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCi:r:R:t:c:F:I:a:",
+	while ((opt = getopt_long(argc, argv, "hflTCi:r:R:t:c:F:I:a:ku",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -312,6 +316,13 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 
 			config->agg_args.aggregation_interval =
 				agg_interval * NS_PER_SECOND;
+			break;
+		case 'k':
+			config->bpf_config.push_individual_events = false;
+			config->bpf_config.agg_rtts = false;
+			break;
+		case 'u':
+			userspace_drop_report = true;
 			break;
 		case 'h':
 			printf("HELP:\n");
@@ -735,6 +746,9 @@ static void print_ns_datetime(FILE *stream, __u64 monotonic_ns)
 
 static void print_event_standard(const union pping_event *e)
 {
+	if (userspace_drop_report)
+		return;
+
 	if (e->event_type == EVENT_TYPE_RTT) {
 		print_ns_datetime(stdout, e->rtt_event.timestamp);
 		printf(" %llu.%06llu ms %llu.%06llu ms %s ",
