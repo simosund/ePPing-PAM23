@@ -779,10 +779,10 @@ static void print_event_ppviz(const union pping_event *e)
 	const struct rtt_event *re = &e->rtt_event;
 	__u64 time = convert_monotonic_to_realtime(re->timestamp);
 
-	printf("%llu.%09llu %llu.%09llu %llu.%09llu ", time / NS_PER_SECOND,
-	       time % NS_PER_SECOND, re->rtt / NS_PER_SECOND,
-	       re->rtt % NS_PER_SECOND, re->min_rtt / NS_PER_SECOND,
-	       re->min_rtt);
+	printf("%llu.%09llu %llu.%09llu %llu.%09llu tsecr=%u ack=%u ",
+	       time / NS_PER_SECOND, time % NS_PER_SECOND,
+	       re->rtt / NS_PER_SECOND, re->rtt % NS_PER_SECOND,
+	       re->min_rtt / NS_PER_SECOND, re->min_rtt, re->tsecr, re->ack);
 	print_flow_ppvizformat(stdout, &re->flow);
 	printf("\n");
 }

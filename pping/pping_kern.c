@@ -97,6 +97,7 @@ struct packet_info {
 		__u8 ipv4_tos;
 		__be32 ipv6_tos;
 	} ip_tos;
+	__u32 tcp_ack;
 	__u16 ip_len;                // The IPv4 total length or IPv6 payload length
 	bool is_ingress;             // Packet on egress or ingress?
 	bool pid_flow_is_dfkey;      // Used to determine which member of dualflow state to use for forward direction
@@ -112,6 +113,7 @@ struct packet_info {
 struct protocol_info {
 	__u32 pid;
 	__u32 reply_pid;
+	__u32 tcp_ack;
 	bool pid_valid;
 	bool reply_pid_valid;
 	enum flow_event_type event_type;
@@ -322,8 +324,8 @@ static int parse_tcp_ts(struct tcphdr *tcph, void *data_end, __u32 *tsval,
 		if (opt == 8 && opt_size == 10) {
 			if (pos + 10 > opt_end || pos + 10 > data_end)
 				return -1;
-			*tsval = *(__u32 *)(pos + 2);
-			*tsecr = *(__u32 *)(pos + 6);
+			*tsval = bpf_ntohl(*(__u32 *)(pos + 2));
+			*tsecr = bpf_ntohl(*(__u32 *)(pos + 6));
 			return 0;
 		}
 
@@ -382,6 +384,7 @@ static int parse_tcp_identifier(struct parsing_context *pctx,
 	*sport = hdr->source;
 	*dport = hdr->dest;
 	*tcph = hdr;
+	proto_info->tcp_ack = bpf_ntohl(hdr->ack_seq);
 
 	return 0;
 }
@@ -414,12 +417,12 @@ static int parse_icmp6_identifier(struct parsing_context *pctx,
 		return -1;
 
 	if (hdr->icmp6_type == ICMPV6_ECHO_REQUEST) {
-		proto_info->pid = hdr->icmp6_sequence;
+		proto_info->pid = bpf_ntohs(hdr->icmp6_sequence);
 		proto_info->pid_valid = true;
 		proto_info->reply_pid = 0;
 		proto_info->reply_pid_valid = false;
 	} else if (hdr->icmp6_type == ICMPV6_ECHO_REPLY) {
-		proto_info->reply_pid = hdr->icmp6_sequence;
+		proto_info->reply_pid = bpf_ntohs(hdr->icmp6_sequence);
 		proto_info->reply_pid_valid = true;
 		proto_info->pid = 0;
 		proto_info->pid_valid = false;
@@ -429,6 +432,7 @@ static int parse_icmp6_identifier(struct parsing_context *pctx,
 
 	proto_info->event_type = FLOW_EVENT_NONE;
 	proto_info->event_reason = EVENT_REASON_NONE;
+	proto_info->tcp_ack = 0;
 	*sport = hdr->icmp6_identifier;
 	*dport = hdr->icmp6_identifier;
 	*icmp6h = hdr;
@@ -451,12 +455,12 @@ static int parse_icmp_identifier(struct parsing_context *pctx,
 		return -1;
 
 	if (hdr->type == ICMP_ECHO) {
-		proto_info->pid = hdr->un.echo.sequence;
+		proto_info->pid = bpf_ntohs(hdr->un.echo.sequence);
 		proto_info->pid_valid = true;
 		proto_info->reply_pid = 0;
 		proto_info->reply_pid_valid = false;
 	} else if (hdr->type == ICMP_ECHOREPLY) {
-		proto_info->reply_pid = hdr->un.echo.sequence;
+		proto_info->reply_pid = bpf_ntohs(hdr->un.echo.sequence);
 		proto_info->reply_pid_valid = true;
 		proto_info->pid = 0;
 		proto_info->pid_valid = false;
@@ -466,6 +470,7 @@ static int parse_icmp_identifier(struct parsing_context *pctx,
 
 	proto_info->event_type = FLOW_EVENT_NONE;
 	proto_info->event_reason = EVENT_REASON_NONE;
+	proto_info->tcp_ack = 0;
 	*sport = hdr->un.echo.id;
 	*dport = hdr->un.echo.id;
 	*icmph = hdr;
@@ -544,6 +549,7 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 	p_info->reply_pid_valid = proto_info.reply_pid_valid;
 	p_info->event_type = proto_info.event_type;
 	p_info->event_reason = proto_info.event_reason;
+	p_info->tcp_ack = proto_info.tcp_ack;
 
 	if (p_info->pid.flow.ipv == AF_INET) {
 		map_ipv4_to_ipv6(&p_info->pid.flow.saddr.ip,
@@ -732,6 +738,8 @@ static void send_rtt_event(void *ctx, __u64 rtt, struct flow_state *f_state,
 		.sent_bytes = f_state->sent_bytes,
 		.rec_pkts = f_state->rec_pkts,
 		.rec_bytes = f_state->rec_bytes,
+		.tsecr = p_info->reply_pid.identifier,
+		.ack = p_info->tcp_ack,
 		.match_on_egress = !p_info->is_ingress,
 		.reserved = { 0 },
 	};

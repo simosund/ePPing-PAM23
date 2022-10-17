@@ -155,6 +155,8 @@ struct rtt_event {
 	__u64 sent_bytes;
 	__u64 rec_pkts;
 	__u64 rec_bytes;
+	__u32 tsecr;
+	__u32 ack;
 	bool match_on_egress;
 	__u8 reserved[7];
 };
