@@ -13,18 +13,7 @@ MAKEFLAGS += --no-print-directory
 Q = @
 endif
 
-SUBDIRS := encap-forward
-SUBDIRS += ktrace-CO-RE
-SUBDIRS += lsm-nobpf
-SUBDIRS += nat64-bpf
-SUBDIRS += pkt-loop-filter
-SUBDIRS += pping
-SUBDIRS += preserve-dscp
-SUBDIRS += tc-basic-classifier
-SUBDIRS += tc-policy
-SUBDIRS += traffic-pacing-edt
-SUBDIRS += AF_XDP-forwarding
-SUBDIRS += AF_XDP-example
+SUBDIRS := pping
 
 .PHONY: check_submodule help clobber distclean clean $(SUBDIRS)
 
